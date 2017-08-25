@@ -6,15 +6,19 @@ import threading
 from modules.runner import Runner
 from modules.environment import Environment
 
+class PollingException(Exception):
+    pass
+
 log = None
 
 CMD_LOGIN = ('az login --service-principal --tenant {} '
              '--username {} '
              '--password {}')
 CMD_SET_ACCOUNT = 'az account set --subscription {}'
-CMD_LIST_GROUPS = 'az group list'
+CMD_LIST_GROUPS = 'az group list --query "[?tags.{}==\'{}\']"'
 CMD_LIST_VMS = 'az vm list --resource-group {}'
 CMD_LIST_LBS = 'az network lb list --resource-group {}'
+CMD_LIST_NICS = 'az network nic list --resource-group {}'
 CMD_SHOW_NIC = 'az network nic show --ids {}'
 CMD_SHOW_PUBLIC_IP = 'az network public-ip show --ids {}'
 
@@ -35,22 +39,12 @@ def set_account():
     log.debug('Set account')
 
 def get_resource_groups():
+    tag_name = Environment.get_resource_group_tag_name()
+    tag_value = Environment.get_resource_group_tag_value()
     cmd = CMD_LIST_GROUPS
-    output = Runner.run_with_output(cmd)
-    log.debug('Fetched resource groups')
+    output = Runner.run_with_output(cmd.format(tag_name, tag_value))
+    log.debug('Fetched cluster resource groups')
     return json.loads(output.decode('utf-8'))
-
-def resource_group_is_cluster(resource_group):
-    if not Environment.get_resource_group_tag_name():
-        return True
-    else:
-        tag_name = Environment.get_resource_group_tag_name()
-        tag_value = Environment.get_resource_group_tag_value()
-        try:
-            return resource_group['tags'][tag_name] == tag_value
-        except KeyError:
-            log.debug('No tags -> %s found, "%s" is not a cluster.', tag_name, resource_group['name'])
-            return False
 
 def get_virtual_machines(resource_group_name):
     cmd = CMD_LIST_VMS.format(resource_group_name)
@@ -60,6 +54,11 @@ def get_virtual_machines(resource_group_name):
 def get_network_interface(interface_id):
     cmd = CMD_SHOW_NIC.format(interface_id)
     log.debug('Fetched network interface for virtual machine')
+    return json.loads(Runner.run_with_output(cmd).decode('utf-8'))
+
+def get_network_interfaces(resource_group_name):
+    cmd = CMD_LIST_NICS.format(resource_group_name)
+    log.debug('Fetched all network interfaces for resource group')
     return json.loads(Runner.run_with_output(cmd).decode('utf-8'))
 
 def get_load_balancers(resource_group_name):
@@ -72,19 +71,29 @@ def get_public_ip(public_ip_id):
     log.debug('Fetched public ip for load balancer')
     return json.loads(Runner.run_with_output(cmd).decode('utf-8'))
 
-def process_virtual_machine(cluster_data, virtual_machine):
+def process_virtual_machine(cluster_data, virtual_machine, nic_list):
+    log.debug('Processing virtual machine "%s"', virtual_machine['name'])
     current_vm = {'name': virtual_machine['name']}
     interface_id = virtual_machine['networkProfile']['networkInterfaces'][0]['id']
-    network_interface = get_network_interface(interface_id)
+    network_interface = find_network_interface_in_list(nic_list, interface_id)
     private_ip = network_interface['ipConfigurations'][0]['privateIpAddress']
     current_vm['private_ip'] = private_ip
     cluster_data['vms'].append(current_vm)
+    return cluster_data
 
-def process_load_balancer(cluster_data, load_balancer):                        
+def find_network_interface_in_list(nic_list, id_to_find):
+    for interface in nic_list:
+        if interface['id'] == id_to_find:
+            return interface
+    raise PollingException()
+
+def process_load_balancer(cluster_data, load_balancer): 
+    log.debug('Processing load balancer "%s"', load_balancer['name'])                       
     current_lb_data = {'name': load_balancer['name']}
     current_lb_data = set_lb_private_ip(current_lb_data, load_balancer)
     current_lb_data = set_lb_public_ip(current_lb_data, load_balancer)
     cluster_data['lbs'].append(current_lb_data)
+    return cluster_data
 
 def set_lb_private_ip(current_lb_data, load_balancer):
     try:
@@ -93,9 +102,9 @@ def set_lb_private_ip(current_lb_data, load_balancer):
             raise KeyError
         log.debug('Load balancer has a private ip')
         current_lb_data['private_ip'] = private_ip
-        return current_lb_data
     except (KeyError, TypeError):
         log.debug('Load balancer is public (has no private ip)')
+    return current_lb_data
 
 def set_lb_public_ip(current_lb_data, load_balancer):
     try:
@@ -105,9 +114,9 @@ def set_lb_public_ip(current_lb_data, load_balancer):
         log.debug('Load balancer has a public ip')
         current_lb_data['public_ip'] = public_ip['ipAddress']
         current_lb_data['fqdn'] = fqdn
-        return current_lb_data
     except (KeyError, TypeError):
         log.debug('Load balancer is private (has no public ip)')
+    return current_lb_data
 
 def create_cluster_data(data, resource_group_name):
     cluster_data = {'name': resource_group_name, 'vms': [], 'lbs': []}
@@ -115,16 +124,19 @@ def create_cluster_data(data, resource_group_name):
     return cluster_data
 
 def process_cluster(data, resource_group_name):
-    log.debug('Resource group "%s" is a cluster', resource_group_name)
+    log.debug('Processing resource group "%s"', resource_group_name)
     virtual_machines = get_virtual_machines(resource_group_name)
     cluster_data = create_cluster_data(data, resource_group_name)
+    nic_list = get_network_interfaces(resource_group_name)
     for virtual_machine in virtual_machines:
-        process_virtual_machine(cluster_data, virtual_machine)
+        cluster_data = process_virtual_machine(cluster_data, virtual_machine, nic_list)
     load_balancers = get_load_balancers(resource_group_name)
     for load_balancer in load_balancers:
-        process_load_balancer(cluster_data, load_balancer)
+        cluster_data = process_load_balancer(cluster_data, load_balancer)
+    return cluster_data
 
 def do_work(queue, lock):
+    global log
     log = logging.getLogger('({}) {}'
                             .format(threading.currentThread().getName(),
                                     __name__))
@@ -140,8 +152,9 @@ def do_work(queue, lock):
             data = {'clusters': []}
             for resource_group in resource_groups:
                 resource_group_name = resource_group['name']
-                if resource_group_is_cluster(resource_group):
-                    process_cluster(data, resource_group_name)
+                cluster_data = process_cluster(data, resource_group_name)
+                data['clusters'].append(cluster_data)
+            print(data)
             queue_data_and_schedule_thread(data, queue, lock)
     finally:
         lock.release()
