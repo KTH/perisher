@@ -1,4 +1,4 @@
-FROM azuresdk/azure-cli-python:2.0.14
+FROM azuresdk/azure-cli-python:2.0.18
 
 RUN mkdir perisher
 RUN mkdir exports
